@@ -1,6 +1,7 @@
 const _ = require('lodash');
 const util = require('util');
 const logger = require('./utils/logger');
+const Deferred = require('./utils/Deferred');
 const log = logger.child({ __filename });
 const Device = require('./devices/Device');
 const IosDriver = require('./devices/drivers/IosDriver');
@@ -23,6 +24,9 @@ const DEVICE_CLASSES = {
   'android.attached': AttachedAndroidDriver,
 };
 
+const _initHandle = Symbol('_initHandle');
+const _assertNoPendingInit = Symbol('_assertNoPendingInit');
+
 class Detox {
   constructor(config) {
     log.trace(
@@ -38,28 +42,24 @@ class Detox {
     this._client = null;
     this._server = null;
     this._artifactsManager = null;
-    this._isInitialized = false;
-    this._initPromise = null;
-    this._rejectInit = _.noop;
+    this[_initHandle] = null;
 
     this.device = null;
   }
 
   init(userParams) {
-    if (!this._initPromise) {
-      this._initPromise = Promise.race([
-        this._doInit(userParams),
-        new Promise((_, reject) => {
-          this._rejectInit = reject;
-        }),
-      ]);
+    if (!this[_initHandle]) {
+      this[_initHandle] = new Deferred();
+
+      const { resolve, reject } = this[_initHandle];
+      this._doInit(userParams).then(resolve, reject);
     }
 
-    return this;
+    return this[_initHandle].promise;
   }
 
   async cleanup() {
-    await this._assertNoPendingInit().catch(_.noop);
+    await this[_assertNoPendingInit]().catch(_.noop);
 
     if (this._artifactsManager) {
       await this._artifactsManager.onBeforeCleanup();
@@ -89,7 +89,7 @@ class Detox {
   }
 
   async beforeEach(testSummary) {
-    await this._assertNoPendingInit();
+    await this[_assertNoPendingInit]();
 
     this._validateTestSummary(testSummary);
     this._logTestRunCheckpoint('DETOX_BEFORE_EACH', testSummary);
@@ -101,7 +101,7 @@ class Detox {
   }
 
   async afterEach(testSummary) {
-    await this._assertNoPendingInit();
+    await this[_assertNoPendingInit]();
 
     this._validateTestSummary(testSummary);
     this._logTestRunCheckpoint('DETOX_AFTER_EACH', testSummary);
@@ -168,20 +168,25 @@ class Detox {
     this._artifactsManager.registerArtifactPlugins(deviceDriver.declareArtifactPlugins());
 
     await this.device.prepare(params);
-    this._isInitialized = true;
-    this._rejectInit = _.noop;
     return this;
   }
 
-  async _assertNoPendingInit() {
-    if (!this._isInitialized) {
-      this._rejectInit(new DetoxRuntimeError({
-        message: 'Aborted detox.init() execution, and now running detox.cleanup()',
-        hint: 'Most likely, your test runner is tearing down the suite due to the timeout error',
-      }));
+  [_assertNoPendingInit]() {
+    const handle = this[_initHandle];
+    if (!handle) {
+      return Promise.resolve();
     }
 
-    await this._initPromise;
+    if (handle.status === Deferred.PENDING) {
+      handle.reject(
+        new DetoxRuntimeError({
+          message: 'Aborted detox.init() execution, and now running detox.cleanup()',
+          hint: 'Most likely, your test runner is tearing down the suite due to the timeout error'
+        })
+      );
+    }
+
+    return handle.promise;
   }
 
   _logTestRunCheckpoint(event, { status, fullName }) {
